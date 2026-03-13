@@ -4,21 +4,30 @@ capacity_forecaster
 Robust capacity planning forecasting engine using SARIMAX with automatic
 model selection, per-group validation, shrinkage forecasting, and
 confidence intervals.
-
 Intended for publication on PyPI.  The public API surface is:
-
     CapacityForecaster          – main forecasting class
     MIN_DATA_POINTS             – recommended minimum observations (36)
     ABSOLUTE_MIN_DATA_POINTS    – hard floor below which fitting is refused (6)
     CONFIDENCE_LEVEL            – CI alpha used throughout (0.95)
     DataQuality                 – string literals for the Data_Quality column
+
+Changes vs previous version
+----------------------------
+* **Gap-tolerant input**: groups may have missing months.  Gaps in ``Hours``,
+  ``Volume``, and ``Shrinkage`` are filled via *linear interpolation* before
+  fitting so the time series handed to SARIMAX always has a complete,
+  regular monthly index.  A per-group ``Imputed_Months`` column in the output
+  records how many months were imputed so consumers can assess data completeness.
+* **Month-end / month-start agnostic**: ``Date`` values can carry any
+  intra-month day (e.g. the 1st *or* the last day of the month).  The engine
+  normalises every date to month-start (``MS``) internally and emits
+  ``MS``-anchored forecast dates.  Both ``"2024-01-01"`` and ``"2024-01-31"``
+  are therefore equivalent inputs.
 """
 
 from __future__ import annotations
-
 import warnings
 from typing import Any, Dict, List, Tuple, cast
-
 import numpy as np
 import pandas as pd
 from statsmodels.tsa.statespace.mlemodel import MLEResultsWrapper
@@ -36,7 +45,6 @@ __all__ = [
 # ---------------------------------------------------------------------------
 # Public constants
 # ---------------------------------------------------------------------------
-
 MIN_DATA_POINTS: int = 36
 """Recommended minimum monthly observations per group for reliable forecasts."""
 
@@ -68,7 +76,6 @@ class DataQuality:
 # ---------------------------------------------------------------------------
 # Private constants
 # ---------------------------------------------------------------------------
-
 _CANDIDATE_ORDERS: List[Tuple[int, int, int]] = [
     (1, 1, 1),
     (0, 1, 1),
@@ -83,10 +90,86 @@ _CANDIDATE_SEASONAL_ORDERS: List[Tuple[int, int, int, int]] = [
     (0, 0, 0, 0),  # Non-seasonal fallback — used automatically for short series
 ]
 
-
 # ---------------------------------------------------------------------------
 # Private helpers
 # ---------------------------------------------------------------------------
+
+
+def _normalise_to_month_start(dates: pd.Series) -> pd.Series:
+    """
+    Normalise any monthly date representation to the first day of that month.
+
+    Handles both ``MS`` (already 1st) and ``ME``/end-of-month dates (last day),
+    as well as any other intra-month day that may appear in the data.  The
+    result is always a ``DatetimeIndex``-compatible ``"MS"``-frequency series.
+
+    Examples
+    --------
+    ``2024-01-31`` → ``2024-01-01``
+    ``2024-01-01`` → ``2024-01-01``
+    ``2024-01-15`` → ``2024-01-01``
+    """
+    return dates.dt.to_period("M").dt.to_timestamp("MS")
+
+
+def _reindex_to_full_monthly_grid(
+    group_df: pd.DataFrame,
+    numeric_cols: List[str],
+) -> Tuple[pd.DataFrame, int]:
+    """
+    Ensure *group_df* has one row per calendar month between its first and
+    last observation.
+
+    Any missing months are inserted with NaN values for *numeric_cols*, then
+    those NaNs are filled by **linear interpolation** (``limit_direction="both"``
+    so leading/trailing gaps are also covered by forward/backward fill).
+
+    Parameters
+    ----------
+    group_df : pd.DataFrame
+        Must have a ``Date`` column already normalised to month-start.
+    numeric_cols : list[str]
+        Column names to interpolate (e.g. ``["Hours", "Volume", "Shrinkage"]``).
+
+    Returns
+    -------
+    filled_df : pd.DataFrame
+        DataFrame with a complete monthly index and no NaNs in *numeric_cols*.
+    imputed_months : int
+        Number of months that were not present in the original data and had
+        to be imputed.
+    """
+    group_df = group_df.copy().sort_values("Date").reset_index(drop=True)
+    full_index = pd.date_range(
+        start=group_df["Date"].iloc[0],
+        end=group_df["Date"].iloc[-1],
+        freq="MS",
+    )
+    # How many months are we expecting vs how many we have?
+    imputed_months = len(full_index) - len(group_df)
+
+    if imputed_months > 0:
+        # Reindex onto the full grid, letting non-numeric columns go NaN
+        group_df = (
+            group_df.set_index("Date")
+            .reindex(full_index)
+            .rename_axis("Date")
+            .reset_index()
+        )
+        # Propagate the group label (constant column)
+        if "Capacity Planning Group" in group_df.columns:
+            group_df["Capacity Planning Group"] = (
+                group_df["Capacity Planning Group"].ffill().bfill()
+            )
+
+    # Interpolate numeric columns regardless (harmless if already complete)
+    for col in numeric_cols:
+        if col in group_df.columns:
+            group_df[col] = group_df[col].interpolate(
+                method="linear", limit_direction="both"
+            )
+
+    return group_df, max(imputed_months, 0)
 
 
 def _is_stationary(series: pd.Series) -> bool:
@@ -106,6 +189,7 @@ def _select_integration_order(series: pd.Series) -> int:
 def _candidate_seasonal_orders(n: int) -> List[Tuple[int, int, int, int]]:
     """
     Restricts seasonal candidates based on series length.
+
     Seasonal SARIMAX requires at least two full seasonal cycles (~24 points).
     Shorter series fall back to non-seasonal orders only.
     """
@@ -133,7 +217,6 @@ def _fit_best_sarimax(series: pd.Series, label: str) -> MLEResultsWrapper:
     """
     d = _select_integration_order(series)
     seasonal_candidates = _candidate_seasonal_orders(len(series))
-
     best_result: MLEResultsWrapper | None = None
     best_aicc = np.inf
     errors: List[str] = []
@@ -156,15 +239,12 @@ def _fit_best_sarimax(series: pd.Series, label: str) -> MLEResultsWrapper:
                         MLEResultsWrapper,
                         model.fit(disp=False, method="lbfgs", maxiter=200),
                     )
-
                 k: int = int(result.df_model)
                 n: int = len(series)
                 aicc: float = float(result.aic) + (2 * k * (k + 1)) / max(n - k - 1, 1)
-
                 if aicc < best_aicc:
                     best_aicc = aicc
                     best_result = result
-
             except Exception as exc:
                 errors.append(f"order={order}, seasonal={seasonal_order}: {exc}")
 
@@ -172,7 +252,6 @@ def _fit_best_sarimax(series: pd.Series, label: str) -> MLEResultsWrapper:
         raise RuntimeError(
             f"All SARIMAX candidates failed for '{label}'.\n" + "\n".join(errors)
         )
-
     return best_result
 
 
@@ -202,6 +281,21 @@ class CapacityForecaster:
     consumers can identify and caveat less reliable forecasts without
     discarding them entirely.
 
+    Gap handling
+    ------------
+    Groups are not required to have a contiguous monthly record.  Any missing
+    months between the first and last observation are automatically detected
+    and filled via linear interpolation before fitting.  The number of imputed
+    months for each group is surfaced in the ``Imputed_Months`` output column
+    so consumers can assess data completeness.
+
+    Date frequency
+    --------------
+    ``Date`` values may be month-start (e.g. ``2024-01-01``), month-end
+    (e.g. ``2024-01-31``), or any other intra-month day.  All dates are
+    normalised to the first of the month internally; forecast output dates
+    are always month-start.
+
     Parameters
     ----------
     weekly_hours : float
@@ -217,18 +311,20 @@ class CapacityForecaster:
     -------------
     Required
         ``Date``                    – monthly period, any parseable format.
+                                      Month-start and month-end are both accepted.
         ``Capacity Planning Group`` – string group identifier.
         ``Hours``                   – numeric workload hours.
         ``Volume``                  – numeric work volume.
     Optional
         ``Shrinkage``               – float in ``[0.0, 1.0)``.  When present,
                                       shrinkage is forecasted per group via
-                                      SARIMAX; missing rows fall back to
-                                      ``default_shrinkage``.
+                                      SARIMAX; missing rows (including imputed
+                                      months) fall back to ``default_shrinkage``
+                                      before interpolation.
 
     Output columns
     --------------
-    ``Date``, ``Capacity Planning Group``, ``Data_Quality``,
+    ``Date``, ``Capacity Planning Group``, ``Data_Quality``, ``Imputed_Months``,
     ``Forecasted_Shrinkage``,
     ``Forecasted_Volume``, ``Forecasted_Volume_Lower``, ``Forecasted_Volume_Upper``,
     ``Forecasted_Hours``,  ``Forecasted_Hours_Lower``,  ``Forecasted_Hours_Upper``,
@@ -258,11 +354,9 @@ class CapacityForecaster:
             raise ValueError(
                 f"default_shrinkage must be in [0.0, 1.0), got {default_shrinkage}."
             )
-
         self.weekly_hours = weekly_hours
         self.forecast_horizon = forecast_horizon
         self.default_shrinkage = default_shrinkage
-
         # Average hours per FTE per calendar month = weekly_hours x (52 / 12)
         self._hours_per_fte_per_month: float = weekly_hours * (52.0 / 12.0)
 
@@ -274,6 +368,19 @@ class CapacityForecaster:
         """
         Validates and returns a cleaned copy of the input.
 
+        Date auto-detection and normalisation
+        --------------------------------------
+        The dominant date convention is auto-detected across the ``Date`` column:
+
+        * **Pure MS** (all dates are the 1st) — accepted silently, no warning.
+        * **Pure ME** (all dates are the last day of their month) — normalised
+          to the 1st with a ``UserWarning`` naming the detected convention.
+        * **Mixed** (both or other intra-month days) — normalised to the 1st
+          with a warning describing the mix so callers can investigate.
+
+        In all cases normalised dates use ``MS`` (first-of-month) frequency
+        and forecast output dates are always month-start.
+
         Raises
         ------
         TypeError
@@ -284,19 +391,48 @@ class CapacityForecaster:
         """
         if not isinstance(df, pd.DataFrame):
             raise TypeError(f"Expected pd.DataFrame, got {type(df).__name__}.")
-
         required = {"Date", "Capacity Planning Group", "Hours", "Volume"}
         missing = required - set(df.columns)
         if missing:
             raise ValueError(f"Missing required columns: {missing}")
-
         if df.empty:
             raise ValueError("Input DataFrame is empty.")
 
         df = df.copy()
 
+        # Parse dates
         if not pd.api.types.is_datetime64_any_dtype(df["Date"]):
             df["Date"] = pd.to_datetime(df["Date"], format="mixed")
+
+        # Auto-detect frequency and normalise to month-start.
+        # We classify the dominant pattern across the whole column:
+        #   - All 1st of month  → pure MS, no warning needed.
+        #   - All last day of their respective month → pure ME, single clean warning.
+        #   - Anything else (mid-month or mixed MS/ME) → mixed warning.
+        days = df["Date"].dt.day
+        month_last_days = df["Date"].dt.days_in_month
+        all_first = (days == 1).all()
+        all_last = (days == month_last_days).all()
+
+        if not all_first:
+            if all_last:
+                freq_desc = "month-end (ME)"
+            else:
+                unique_days = days.nunique()
+                freq_desc = (
+                    "mixed month-start and month-end"
+                    if unique_days <= 2
+                    else f"mixed intra-month days ({unique_days} distinct day values)"
+                )
+            warnings.warn(
+                f"Date column appears to use {freq_desc} dates.  "
+                "All dates have been normalised to month-start (the 1st of each "
+                "month) internally so that MS and ME inputs are treated "
+                "identically.  Forecast output dates will be month-start.",
+                UserWarning,
+                stacklevel=3,
+            )
+        df["Date"] = _normalise_to_month_start(df["Date"])
 
         if "Shrinkage" in df.columns:
             bad = df["Shrinkage"].dropna()
@@ -316,7 +452,6 @@ class CapacityForecaster:
                 UserWarning,
                 stacklevel=3,
             )
-
         return df
 
     # ------------------------------------------------------------------
@@ -324,7 +459,7 @@ class CapacityForecaster:
     # ------------------------------------------------------------------
 
     def _build_forecast_index(self, last_date: pd.Timestamp) -> pd.DatetimeIndex:
-        """Monthly DatetimeIndex for the forecast period."""
+        """Monthly DatetimeIndex (MS) for the forecast period."""
         return pd.date_range(
             start=last_date + pd.offsets.MonthBegin(1),
             periods=self.forecast_horizon,
@@ -342,13 +477,11 @@ class CapacityForecaster:
         """
         series = series.clip(lower=0)
         fitted = _fit_best_sarimax(series, label)
-
         forecast_obj = fitted.get_forecast(steps=self.forecast_horizon)
         predicted: np.ndarray = np.clip(forecast_obj.predicted_mean.values, 0, None)
         ci = forecast_obj.conf_int(alpha=1.0 - CONFIDENCE_LEVEL)
         lower_ci: np.ndarray = np.clip(ci.iloc[:, 0].values, 0, None)
         upper_ci: np.ndarray = ci.iloc[:, 1].values
-
         return predicted, lower_ci, upper_ci
 
     def _forecast_shrinkage(self, series: pd.Series, label: str) -> np.ndarray:
@@ -383,10 +516,15 @@ class CapacityForecaster:
         """
         Produce a capacity forecast for every group in *df*.
 
+        Missing months within a group's date range are automatically filled
+        via linear interpolation before fitting.  The ``Imputed_Months``
+        column in the output records how many months were imputed per group.
+
         Groups with fewer than ``ABSOLUTE_MIN_DATA_POINTS`` (6) observations
-        are skipped entirely with a warning.  Groups with between 6 and 35
-        observations are forecasted but flagged ``Data_Quality = "LOW_HISTORY"``
-        in the output — consumers should treat these results with caution.
+        *after* gap-filling are skipped entirely with a warning.  Groups with
+        between 6 and 35 observations are forecasted but flagged
+        ``Data_Quality = "LOW_HISTORY"`` in the output — consumers should
+        treat these results with caution.
 
         Parameters
         ----------
@@ -405,20 +543,41 @@ class CapacityForecaster:
         """
         df = self._validate_dataframe(df)
         df = df.sort_values("Date").reset_index(drop=True)
-
         has_shrinkage_col = "Shrinkage" in df.columns
+
+        # Columns to interpolate across the full monthly grid
+        interpolate_cols = ["Hours", "Volume"]
+        if has_shrinkage_col:
+            interpolate_cols.append("Shrinkage")
+
         results: List[pd.DataFrame] = []
         skipped: List[str] = []
 
         for group, group_df in df.groupby("Capacity Planning Group"):
             group_name: str = str(group)
+
+            # ----------------------------------------------------------
+            # Gap-fill: reindex to full monthly grid and interpolate
+            # ----------------------------------------------------------
+            group_df, imputed_months = _reindex_to_full_monthly_grid(
+                group_df, interpolate_cols
+            )
+
+            if imputed_months > 0:
+                warnings.warn(
+                    f"Group '{group_name}': {imputed_months} missing month(s) "
+                    "detected and filled via linear interpolation.",
+                    UserWarning,
+                    stacklevel=2,
+                )
+
             n = len(group_df)
 
             # Hard floor — impossible to fit any model below this
             if n < ABSOLUTE_MIN_DATA_POINTS:
                 warnings.warn(
-                    f"Group '{group_name}' has only {n} observation(s). "
-                    f"Minimum required to attempt a forecast: {ABSOLUTE_MIN_DATA_POINTS}. "
+                    f"Group '{group_name}' has only {n} observation(s) after "
+                    f"gap-filling. Minimum required: {ABSOLUTE_MIN_DATA_POINTS}. "
                     "Skipping.",
                     UserWarning,
                     stacklevel=2,
@@ -493,6 +652,7 @@ class CapacityForecaster:
                         "Date": forecast_index,
                         "Capacity Planning Group": group_name,
                         "Data_Quality": data_quality,
+                        "Imputed_Months": imputed_months,
                         "Forecasted_Shrinkage": np.round(shrinkage_pred, 4),
                         "Forecasted_Volume": vol_pred,
                         "Forecasted_Volume_Lower": vol_lo,
@@ -518,13 +678,11 @@ class CapacityForecaster:
             )
 
         final_df = pd.concat(results, ignore_index=True)
-
         for col in final_df.columns:
             if "FTE" in col:
                 final_df[col] = final_df[col].round(2)
             elif "Volume" in col or "Hours" in col:
                 final_df[col] = final_df[col].round(0)
-
         return final_df
 
     def diagnostic_summary(self, df: pd.DataFrame) -> Dict[str, Dict[str, Any]]:
@@ -532,7 +690,10 @@ class CapacityForecaster:
         Returns per-group model metadata without running a full forecast.
 
         Useful for inspecting which SARIMAX orders were selected, AICc
-        scores, and stationarity results for each series.
+        scores, and stationarity results for each series.  Gap-filling is
+        applied in the same way as :meth:`forecast` so the ``n_obs`` count
+        reflects the post-imputation series length and ``imputed_months``
+        is reported alongside it.
 
         Parameters
         ----------
@@ -544,7 +705,8 @@ class CapacityForecaster:
         dict[str, dict]
             Keys are group names.  Each value contains:
 
-            - ``n_obs``           – number of historical observations.
+            - ``n_obs``           – number of observations after gap-filling.
+            - ``imputed_months``  – number of months imputed.
             - ``data_quality``    – ``"OK"`` or ``"LOW_HISTORY"``.
             - ``hours_model``     – fitted model metadata for Hours.
             - ``volume_model``    – fitted model metadata for Volume.
@@ -553,17 +715,29 @@ class CapacityForecaster:
         """
         df = self._validate_dataframe(df)
         df = df.sort_values("Date").reset_index(drop=True)
-
         has_shrinkage_col = "Shrinkage" in df.columns
+
+        interpolate_cols = ["Hours", "Volume"]
+        if has_shrinkage_col:
+            interpolate_cols.append("Shrinkage")
+
         summary: Dict[str, Dict[str, Any]] = {}
 
         for group, group_df in df.groupby("Capacity Planning Group"):
             group_name: str = str(group)
+
+            group_df, imputed_months = _reindex_to_full_monthly_grid(
+                group_df, interpolate_cols
+            )
             n = len(group_df)
 
             if n < ABSOLUTE_MIN_DATA_POINTS:
                 summary[group_name] = {
-                    "status": f"skipped — fewer than {ABSOLUTE_MIN_DATA_POINTS} observations"
+                    "status": (
+                        f"skipped — fewer than {ABSOLUTE_MIN_DATA_POINTS} "
+                        "observations after gap-filling"
+                    ),
+                    "imputed_months": imputed_months,
                 }
                 continue
 
@@ -573,7 +747,11 @@ class CapacityForecaster:
             data_quality = (
                 DataQuality.OK if n >= MIN_DATA_POINTS else DataQuality.LOW_HISTORY
             )
-            group_info: Dict[str, Any] = {"n_obs": n, "data_quality": data_quality}
+            group_info: Dict[str, Any] = {
+                "n_obs": n,
+                "imputed_months": imputed_months,
+                "data_quality": data_quality,
+            }
 
             series_to_diagnose: List[str] = ["Hours", "Volume"]
             if has_shrinkage_col:
