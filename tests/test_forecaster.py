@@ -9,6 +9,8 @@ Run with:
 
 from __future__ import annotations
 
+import warnings
+
 import numpy as np
 import pandas as pd
 import pytest
@@ -364,6 +366,7 @@ class TestDataQuality:
     def test_data_quality_constants(self) -> None:
         assert DataQuality.OK == "OK"
         assert DataQuality.LOW_HISTORY == "LOW_HISTORY"
+        assert DataQuality.FAILED == "FAILED"
 
 
 # ---------------------------------------------------------------------------
@@ -525,6 +528,85 @@ class TestPositionalColumns:
         result = forecaster.forecast(df)
         # Raw FTE should be a plausible headcount (roughly 1–50 for typical inputs)
         assert result["Forecasted_FTE"].max() < 500
+
+
+# ---------------------------------------------------------------------------
+# 7b. Group failure handling
+# ---------------------------------------------------------------------------
+
+
+class TestGroupFailureHandling:
+    def test_failed_group_appears_in_results_with_failed_quality(
+        self, forecaster: CapacityForecaster
+    ) -> None:
+        # Group below ABSOLUTE_MIN_DATA_POINTS threshold — explicitly rejected before fitting.
+        tiny = _make_df(ABSOLUTE_MIN_DATA_POINTS - 1, groups=["Tiny"], seed=99)
+        ok = _make_df(MIN_DATA_POINTS, groups=["OK"], seed=1)
+        df = pd.concat([tiny, ok], ignore_index=True)
+        with pytest.warns(UserWarning):
+            result = forecaster.forecast(df)
+        assert "Tiny" in result["team"].values
+        tiny_rows = result[result["team"] == "Tiny"]
+        assert (tiny_rows["Data_Quality"] == DataQuality.FAILED).all()
+
+    def test_failed_group_has_nan_forecast_values(
+        self, forecaster: CapacityForecaster
+    ) -> None:
+        tiny = _make_df(ABSOLUTE_MIN_DATA_POINTS - 1, groups=["Tiny"], seed=99)
+        ok = _make_df(MIN_DATA_POINTS, groups=["OK"], seed=1)
+        df = pd.concat([tiny, ok], ignore_index=True)
+        with pytest.warns(UserWarning):
+            result = forecaster.forecast(df)
+        tiny_rows = result[result["team"] == "Tiny"]
+        forecast_cols = [c for c in tiny_rows.columns if c.startswith("Forecasted_")]
+        for col in forecast_cols:
+            assert tiny_rows[col].isna().all(), f"{col} should be NaN for failed group"
+
+    def test_failed_group_correct_row_count(
+        self, forecaster: CapacityForecaster
+    ) -> None:
+        tiny = _make_df(ABSOLUTE_MIN_DATA_POINTS - 1, groups=["Tiny"], seed=99)
+        ok = _make_df(MIN_DATA_POINTS, groups=["OK"], seed=1)
+        df = pd.concat([tiny, ok], ignore_index=True)
+        with pytest.warns(UserWarning):
+            result = forecaster.forecast(df)
+        tiny_rows = result[result["team"] == "Tiny"]
+        assert len(tiny_rows) == forecaster.forecast_horizon
+
+    def test_failed_group_emits_warning_with_group_name(
+        self, forecaster: CapacityForecaster
+    ) -> None:
+        tiny = _make_df(ABSOLUTE_MIN_DATA_POINTS - 1, groups=["Tiny"], seed=99)
+        ok = _make_df(MIN_DATA_POINTS, groups=["OK"], seed=1)
+        df = pd.concat([tiny, ok], ignore_index=True)
+        with pytest.warns(UserWarning) as record:
+            forecaster.forecast(df)
+        messages = " ".join(str(w.message) for w in record)
+        assert "Tiny" in messages
+
+    def test_surviving_groups_unaffected_by_peer_failure(
+        self, forecaster: CapacityForecaster
+    ) -> None:
+        tiny = _make_df(ABSOLUTE_MIN_DATA_POINTS - 1, groups=["Tiny"], seed=99)
+        ok = _make_df(MIN_DATA_POINTS, groups=["OK"], seed=1)
+        df = pd.concat([tiny, ok], ignore_index=True)
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore", UserWarning)
+            result = forecaster.forecast(df)
+        ok_rows = result[result["team"] == "OK"]
+        assert len(ok_rows) == forecaster.forecast_horizon
+        assert (ok_rows["Data_Quality"] == DataQuality.OK).all()
+
+    def test_all_groups_failing_still_returns_dataframe(
+        self, forecaster: CapacityForecaster
+    ) -> None:
+        # Even if every group fails, we get a DataFrame back with FAILED rows.
+        tiny = _make_df(ABSOLUTE_MIN_DATA_POINTS - 1, groups=["Tiny"], seed=99)
+        with pytest.warns(UserWarning):
+            result = forecaster.forecast(tiny)
+        assert isinstance(result, pd.DataFrame)
+        assert len(result) == forecaster.forecast_horizon
+        assert (result["Data_Quality"] == DataQuality.FAILED).all()
 
 
 # ---------------------------------------------------------------------------

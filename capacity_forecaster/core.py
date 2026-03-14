@@ -53,6 +53,7 @@ CONFIDENCE_LEVEL: float = 0.95
 class DataQuality:
     OK: str = "OK"
     LOW_HISTORY: str = "LOW_HISTORY"
+    FAILED: str = "FAILED"
 
 
 # ---------------------------------------------------------------------------
@@ -418,86 +419,150 @@ class CapacityForecaster:
             numeric_cols.append(_COL_SHRINKAGE)
 
         results: list[pd.DataFrame] = []
+        failed_groups: list[str] = []
 
         for group, group_df in df.groupby(_COL_GROUP):
             group_name = str(group)
-
-            group_df, imputed_months = _reindex_to_full_monthly_grid(
-                group_df,
-                numeric_cols=numeric_cols,
-                group_col=_COL_GROUP,
-                rate_cols=[_COL_SHRINKAGE] if has_shrinkage else None,
-            )
-
-            dates = pd.DatetimeIndex(group_df[_COL_DATE].values)
-            forecast_index = pd.date_range(
-                start=dates[-1] + pd.offsets.MonthBegin(1),
-                periods=self.forecast_horizon,
-                freq="MS",
-            )
-
-            vol_series = _make_monthly_series(group_df[_COL_VOLUME].to_numpy(), dates)
-            hrs_series = _make_monthly_series(group_df[_COL_HOURS].to_numpy(), dates)
-
-            vol_pred, vol_lo, vol_hi = self._forecast_series(
-                vol_series, f"{group_name}/volume"
-            )
-            hrs_pred, hrs_lo, hrs_hi = self._forecast_series(
-                hrs_series, f"{group_name}/hours"
-            )
-
-            if has_shrinkage:
-                # Compute fallback from the *raw* (pre-interpolation) values so
-                # that all-NaN or sparse columns don't silently use 0.0 (the
-                # result of interpolating an all-NaN column).
-                raw_shrink = df.loc[df[_COL_GROUP] == group, _COL_SHRINKAGE]
-                n_raw_valid = int(raw_shrink.notna().sum())
-                fallback = (
-                    float(raw_shrink.mean())
-                    if n_raw_valid > 0
-                    else self.default_shrinkage
+            try:
+                n_obs = len(group_df)
+                if n_obs < ABSOLUTE_MIN_DATA_POINTS:
+                    raise ValueError(
+                        f"Only {n_obs} month(s) of data available; "
+                        f"at least {ABSOLUTE_MIN_DATA_POINTS} are required to fit a model."
+                    )
+                group_df, imputed_months = _reindex_to_full_monthly_grid(
+                    group_df,
+                    numeric_cols=numeric_cols,
+                    group_col=_COL_GROUP,
+                    rate_cols=[_COL_SHRINKAGE] if has_shrinkage else None,
                 )
-                shrink_series = _make_monthly_series(
-                    group_df[_COL_SHRINKAGE].to_numpy(), dates
-                )
-                shrinkage_pred = self._shrinkage_forecast(
-                    shrink_series, f"{group_name}/shrinkage", fallback, n_raw_valid
-                )
-            else:
-                shrinkage_pred = np.full(self.forecast_horizon, self.default_shrinkage)
 
-            m = self._hours_per_fte_per_month
-            availability = 1.0 - shrinkage_pred
-            fte_pred = hrs_pred / m
-            fte_lo = hrs_lo / m
-            fte_hi = hrs_hi / m
-
-            results.append(
-                pd.DataFrame(
-                    {
-                        "Date": forecast_index,
-                        orig_group: group_name,
-                        "Forecasted_Volume": vol_pred,
-                        "Forecasted_Volume_Lower": vol_lo,
-                        "Forecasted_Volume_Upper": vol_hi,
-                        "Forecasted_Hours": hrs_pred,
-                        "Forecasted_Hours_Lower": hrs_lo,
-                        "Forecasted_Hours_Upper": hrs_hi,
-                        "Forecasted_FTE": fte_pred,
-                        "Forecasted_FTE_Lower": fte_lo,
-                        "Forecasted_FTE_Upper": fte_hi,
-                        "Forecasted_FTE_Adjusted": fte_pred / availability,
-                        "Forecasted_FTE_Adjusted_Lower": fte_lo / availability,
-                        "Forecasted_FTE_Adjusted_Upper": fte_hi / availability,
-                        "Shrinkage_Used": shrinkage_pred,
-                        "Imputed_Months": imputed_months,
-                        "Data_Quality": (
-                            DataQuality.LOW_HISTORY
-                            if len(group_df) < MIN_DATA_POINTS
-                            else DataQuality.OK
-                        ),
-                    }
+                dates = pd.DatetimeIndex(group_df[_COL_DATE].values)
+                forecast_index = pd.date_range(
+                    start=dates[-1] + pd.offsets.MonthBegin(1),
+                    periods=self.forecast_horizon,
+                    freq="MS",
                 )
+
+                vol_series = _make_monthly_series(
+                    group_df[_COL_VOLUME].to_numpy(), dates
+                )
+                hrs_series = _make_monthly_series(
+                    group_df[_COL_HOURS].to_numpy(), dates
+                )
+
+                vol_pred, vol_lo, vol_hi = self._forecast_series(
+                    vol_series, f"{group_name}/volume"
+                )
+                hrs_pred, hrs_lo, hrs_hi = self._forecast_series(
+                    hrs_series, f"{group_name}/hours"
+                )
+
+                if has_shrinkage:
+                    # Compute fallback from the *raw* (pre-interpolation) values so
+                    # that all-NaN or sparse columns don't silently use 0.0 (the
+                    # result of interpolating an all-NaN column).
+                    raw_shrink = df.loc[df[_COL_GROUP] == group, _COL_SHRINKAGE]
+                    n_raw_valid = int(raw_shrink.notna().sum())
+                    fallback = (
+                        float(raw_shrink.mean())
+                        if n_raw_valid > 0
+                        else self.default_shrinkage
+                    )
+                    shrink_series = _make_monthly_series(
+                        group_df[_COL_SHRINKAGE].to_numpy(), dates
+                    )
+                    shrinkage_pred = self._shrinkage_forecast(
+                        shrink_series, f"{group_name}/shrinkage", fallback, n_raw_valid
+                    )
+                else:
+                    shrinkage_pred = np.full(
+                        self.forecast_horizon, self.default_shrinkage
+                    )
+
+                m = self._hours_per_fte_per_month
+                availability = 1.0 - shrinkage_pred
+                fte_pred = hrs_pred / m
+                fte_lo = hrs_lo / m
+                fte_hi = hrs_hi / m
+
+                results.append(
+                    pd.DataFrame(
+                        {
+                            "Date": forecast_index,
+                            orig_group: group_name,
+                            "Forecasted_Volume": vol_pred,
+                            "Forecasted_Volume_Lower": vol_lo,
+                            "Forecasted_Volume_Upper": vol_hi,
+                            "Forecasted_Hours": hrs_pred,
+                            "Forecasted_Hours_Lower": hrs_lo,
+                            "Forecasted_Hours_Upper": hrs_hi,
+                            "Forecasted_FTE": fte_pred,
+                            "Forecasted_FTE_Lower": fte_lo,
+                            "Forecasted_FTE_Upper": fte_hi,
+                            "Forecasted_FTE_Adjusted": fte_pred / availability,
+                            "Forecasted_FTE_Adjusted_Lower": fte_lo / availability,
+                            "Forecasted_FTE_Adjusted_Upper": fte_hi / availability,
+                            "Shrinkage_Used": shrinkage_pred,
+                            "Imputed_Months": imputed_months,
+                            "Data_Quality": (
+                                DataQuality.LOW_HISTORY
+                                if len(group_df) < MIN_DATA_POINTS
+                                else DataQuality.OK
+                            ),
+                        }
+                    )
+                )
+
+            except Exception as exc:
+                failed_groups.append(group_name)
+                warnings.warn(
+                    f"Group '{group_name}' could not be forecast and will appear "
+                    f"with NaN values and Data_Quality='{DataQuality.FAILED}': {exc}",
+                    UserWarning,
+                    stacklevel=2,
+                )
+                # Build a NaN-filled skeleton row so the group is always visible
+                # in the output. The caller can filter on Data_Quality != FAILED
+                # if they only want successful forecasts.
+                nan_col = np.full(self.forecast_horizon, np.nan)
+                last_date = group_df[_COL_DATE].iloc[-1]
+                forecast_index = pd.date_range(
+                    start=last_date + pd.offsets.MonthBegin(1),
+                    periods=self.forecast_horizon,
+                    freq="MS",
+                )
+                results.append(
+                    pd.DataFrame(
+                        {
+                            "Date": forecast_index,
+                            orig_group: group_name,
+                            "Forecasted_Volume": nan_col,
+                            "Forecasted_Volume_Lower": nan_col,
+                            "Forecasted_Volume_Upper": nan_col,
+                            "Forecasted_Hours": nan_col,
+                            "Forecasted_Hours_Lower": nan_col,
+                            "Forecasted_Hours_Upper": nan_col,
+                            "Forecasted_FTE": nan_col,
+                            "Forecasted_FTE_Lower": nan_col,
+                            "Forecasted_FTE_Upper": nan_col,
+                            "Forecasted_FTE_Adjusted": nan_col,
+                            "Forecasted_FTE_Adjusted_Lower": nan_col,
+                            "Forecasted_FTE_Adjusted_Upper": nan_col,
+                            "Shrinkage_Used": nan_col,
+                            "Imputed_Months": 0,
+                            "Data_Quality": DataQuality.FAILED,
+                        }
+                    )
+                )
+
+        if failed_groups:
+            warnings.warn(
+                f"{len(failed_groups)} group(s) could not be forecast: {failed_groups}. "
+                f"They appear in results with Data_Quality='{DataQuality.FAILED}' "
+                "and NaN forecast values.",
+                UserWarning,
+                stacklevel=2,
             )
 
         return pd.concat(results, ignore_index=True)
