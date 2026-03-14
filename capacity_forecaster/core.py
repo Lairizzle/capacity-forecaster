@@ -134,6 +134,11 @@ def _resolve_columns(
 def _normalise_to_month_start(dates: pd.Series) -> pd.Series:
     """
     Coerce any monthly date series to the first of each month.
+
+    Works with month-start, month-end, or mid-month inputs and is compatible
+    with pandas 1.x through 2.x (``to_timestamp(how=…)`` was removed in 2.x;
+    omitting the argument defaults to "start" in all versions).
+
     Examples: 2024-01-31 → 2024-01-01, 2024-01-15 → 2024-01-01
     """
     return dates.dt.to_period("M").dt.to_timestamp()
@@ -142,6 +147,10 @@ def _normalise_to_month_start(dates: pd.Series) -> pd.Series:
 def _make_monthly_series(values: np.ndarray, dates: pd.DatetimeIndex) -> pd.Series:
     """
     Wrap *values* in a Series with a month-start ``DatetimeIndex``.
+
+    Uses ``pd.date_range`` to construct the index rather than mutating
+    ``idx.freq`` in place — the latter was deprecated in pandas 2.2 and
+    removed in 3.x.
     """
     idx = pd.date_range(start=dates[0], periods=len(dates), freq="MS")
     return pd.Series(values, index=idx)
@@ -151,28 +160,37 @@ def _reindex_to_full_monthly_grid(
     group_df: pd.DataFrame,
     numeric_cols: list[str],
     group_col: str,
+    rate_cols: list[str] | None = None,
 ) -> tuple[pd.DataFrame, int]:
     """
     Guarantee *group_df* has exactly one row per calendar month.
 
     Duplicate months (from mixed month-start/end inputs collapsed during
-    normalisation) are aggregated by summing numeric columns and keeping the
-    first group label.  Missing months are inserted and their numeric columns
-    filled by linear interpolation.
+    normalisation) are aggregated and the result reindexed to a full monthly
+    grid.  Missing months are filled by linear interpolation.
+
+    Additive columns (volume, hours) are summed across duplicate months.
+    Rate columns (shrinkage) are averaged — summing a rate is meaningless and
+    would turn NaN rows into 0.0, corrupting the fallback logic.
 
     Parameters
     ----------
     group_df     : DataFrame for a single group (dates already normalised).
     numeric_cols : Canonical column names to interpolate.
     group_col    : Canonical column name carrying the group label.
+    rate_cols    : Subset of numeric_cols that should be aggregated with
+                   "mean" rather than "sum". NaN-only months stay NaN.
 
     Returns
     -------
     (filled_df, imputed_months)
     """
     group_df = group_df.copy()
+    rate_set = set(rate_cols or [])
 
-    agg: dict[str, str] = {col: "sum" for col in numeric_cols}
+    agg: dict[str, str] = {
+        col: ("mean" if col in rate_set else "sum") for col in numeric_cols
+    }
     agg[group_col] = "first"
     group_df = (
         group_df.groupby(_COL_DATE, as_index=False)
@@ -300,22 +318,30 @@ class CapacityForecaster:
         upper_ci = ci.iloc[:, 1].to_numpy()
         return predicted, lower_ci, upper_ci
 
-    def _shrinkage_forecast(self, shrink_series: pd.Series, label: str) -> np.ndarray:
+    def _shrinkage_forecast(
+        self, shrink_series: pd.Series, label: str, fallback: float, n_raw_valid: int
+    ) -> np.ndarray:
         """
         Forecast shrinkage for the horizon.
 
         Strategy (in order of preference):
-        1. SARIMAX forecast when >= ABSOLUTE_MIN_DATA_POINTS valid points exist.
-        2. Historical group mean when fewer valid points exist.
-        3. ``default_shrinkage`` when no valid points exist at all.
+        1. SARIMAX forecast when the *original* (pre-interpolation) observation
+           count >= ABSOLUTE_MIN_DATA_POINTS.
+        2. ``fallback`` otherwise — the historical group mean of those raw
+           observations, or ``default_shrinkage`` when none existed.
 
         The result is clipped to [0.0, 0.9999] to keep availability positive.
+
+        Parameters
+        ----------
+        shrink_series : gap-filled shrinkage Series (post-interpolation).
+        label         : group/metric label for error messages.
+        fallback      : pre-computed safe default derived from raw observations.
+        n_raw_valid   : number of non-NaN shrinkage values *before* gap-filling.
+                        Used for model-fitting gating so that interpolated zeros
+                        do not inflate the apparent observation count.
         """
-        n_valid = int(shrink_series.notna().sum())
-        fallback = (
-            float(shrink_series.mean()) if n_valid > 0 else self.default_shrinkage
-        )
-        if n_valid >= ABSOLUTE_MIN_DATA_POINTS:
+        if n_raw_valid >= ABSOLUTE_MIN_DATA_POINTS:
             try:
                 pred, _, _ = self._forecast_series(
                     shrink_series.fillna(fallback), label
@@ -397,7 +423,10 @@ class CapacityForecaster:
             group_name = str(group)
 
             group_df, imputed_months = _reindex_to_full_monthly_grid(
-                group_df, numeric_cols=numeric_cols, group_col=_COL_GROUP
+                group_df,
+                numeric_cols=numeric_cols,
+                group_col=_COL_GROUP,
+                rate_cols=[_COL_SHRINKAGE] if has_shrinkage else None,
             )
 
             dates = pd.DatetimeIndex(group_df[_COL_DATE].values)
@@ -418,11 +447,21 @@ class CapacityForecaster:
             )
 
             if has_shrinkage:
+                # Compute fallback from the *raw* (pre-interpolation) values so
+                # that all-NaN or sparse columns don't silently use 0.0 (the
+                # result of interpolating an all-NaN column).
+                raw_shrink = df.loc[df[_COL_GROUP] == group, _COL_SHRINKAGE]
+                n_raw_valid = int(raw_shrink.notna().sum())
+                fallback = (
+                    float(raw_shrink.mean())
+                    if n_raw_valid > 0
+                    else self.default_shrinkage
+                )
                 shrink_series = _make_monthly_series(
                     group_df[_COL_SHRINKAGE].to_numpy(), dates
                 )
                 shrinkage_pred = self._shrinkage_forecast(
-                    shrink_series, f"{group_name}/shrinkage"
+                    shrink_series, f"{group_name}/shrinkage", fallback, n_raw_valid
                 )
             else:
                 shrinkage_pred = np.full(self.forecast_horizon, self.default_shrinkage)
